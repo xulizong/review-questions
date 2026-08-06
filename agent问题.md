@@ -346,16 +346,31 @@ RUNNING
 
 ### Checkpoint 应保存的内容
 
-- `run_id`、`checkpoint_id`、顺序号和当前状态。
-- 当前执行节点、已完成步骤和下一步动作。
-- 必要的上下文摘要、业务变量和 Artifact 引用。
-- 待审批的工具名、规范化参数及 `arguments_hash`。
-- 操作预览，例如目标对象、金额、影响范围和前后差异。
-- 前置条件，例如记录版本、订单状态和资源归属。
-- `action_id` 与幂等键，防止恢复后重复执行。
-- Workflow、Prompt、工具、Schema 和审批策略版本。
-- 所需审批角色、创建时间、过期时间及快照校验和。
+- 执行位置：当前Workflow节点、步骤ID、Agent轮次。
+- 任务状态：待执行、执行中、成功、失败，以及失败原因。
+- 关键上下文：用户目标、已确认参数、Planner生成的计划、步骤依赖。
+- 中间结果：已生成的SQL、工具返回结果ID、数据文件路径、阶段性结论。
+- 副作用记录：哪些数据库写入、消息发送、文件修改已经完成，避免恢复后重复执行。
+- 版本信息：工作流版本、Prompt版本、模型与工具版本，防止新代码错误读取旧Checkpoint。
+- 恢复控制信息：重试次数、超时时间、最后更新时间、下一步执行动作。
 
+```text
+checkpoint = {
+    "workflow_id": "wf_1001",
+    "current_step": "execute_sql",
+    "status": "running",
+    "context": {
+        "query": "查询昨日成交金额",
+        "sql": "SELECT SUM(gmv) FROM orders WHERE dt='2026-08-04'"
+    },
+    "completed_steps": ["intent", "plan", "generate_sql"],
+    "result_refs": {
+        "knowledge_result_id": "result_123"
+    },
+    "retry_count": 1,
+    "workflow_version": "v2"
+}
+```
 数据库连接、文件句柄、临时令牌等运行时资源不能放入快照，恢复时应重新获取短期凭证。
 
 ### 暂停流程
@@ -369,24 +384,15 @@ Agent 产生高风险 Tool Call 后，只生成操作提案，不立即执行。
 
 事务提交后，Worker 退出并释放资源。这样可以避免审批通知已经发出但快照尚未保存，也不会在等待期间长期占用数据库连接和锁。
 
-### 审批与恢复流程
-
-审批必须绑定：
-
-```text
-checkpoint_id + action_id + arguments_hash + approver + expires_at
-```
-
-用户批准后，Resume Worker：
-
-1. 使用锁或版本号领取该 Run，防止多个 Worker 同时恢复。
-2. 校验快照完整性、审批状态、有效期和参数哈希。
-3. 重新读取当前业务状态，检查权限、记录版本、金额和对象状态是否变化。
-4. 如果状态已变化，使旧审批失效并重新申请，避免审批与执行之间的 TOCTOU 问题。
-5. 使用 `action_id` 或幂等键执行一次工具调用。
-6. 执行后验证真实结果，保存新的 Checkpoint，再推进状态机。
-
-如果用户修改了工具参数，不应直接修改原审批单，而要生成新的操作提案、参数哈希和 Checkpoint。
+### 恢复时候的核心流程
+- 读取检查点：加载current_step、已完成步骤、上下文和中间结果引用。
+- 校验兼容性：检查Workflow版本、Checkpoint Schema版本、Prompt和工具版本是否兼容。
+- 获取执行锁：为workflow_id加锁或租约，防止原实例尚未停止，新实例又重复恢复。
+- 核对真实状态：Checkpoint可能写着running，但外部操作可能已经成功，需要查询数据库、任务平台或第三方接口确认。
+- 确定恢复位置：通常从最近一个已提交的原子步骤之后继续，而不是从进程中断的代码行继续。
+- 恢复上下文：加载参数、计划、步骤结果和外部文件引用，并验证引用仍然存在。
+- 处理重试：增加retry_count，检查是否超过重试上限，决定立即重试、延迟重试还是人工介入。
+- 重新执行并写新Checkpoint：状态先更新为recovering，步骤成功后原子写入新的Checkpoint。
 
 ### 建议的数据表
 
